@@ -43,4 +43,4 @@ Key design rules that span multiple modules:
 
 ## Testing
 
-Mock outbound HTTP in unit tests; integration/end-to-end tests run against the Docker services. Use short deterministic timeouts and tiny retry delays to keep the suite fast. The required test cases are enumerated in PRD §11.
+`tests/conftest.py` creates a separate `<db>_test` database, rebuilds it with Alembic (`downgrade base` + `upgrade head`) once per session, and `TRUNCATE`s tables before each test; `test_migrations.py` runs `alembic check` so model changes without a migration fail. Ruff is configured to treat `alembic` as third-party (the local `alembic/` folder would shadow it). Mock outbound HTTP in unit tests; integration/end-to-end tests run against the Docker services. Use short deterministic timeouts and tiny retry delays to keep the suite fast. The required test cases are enumerated in PRD §11.

@@ -1,33 +1,22 @@
-from collections.abc import Iterator
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-from app.main import app
-from app.models.order import OrderStatus
-from app.schemas.order import OrderCreate
-from app.services.order_service import OrderService, get_order_service
+from app.models.order import Order, OrderStatus
+
+pytestmark = pytest.mark.integration
 
 VALID_PAYLOAD = {"customer_id": "CLIENT-123", "product_id": "PRODUCT-456", "quantity": 10}
 
 
-@pytest.fixture
-def service() -> OrderService:
-    return OrderService()
-
-
-@pytest.fixture
-def client(service: OrderService) -> Iterator[TestClient]:
-    app.dependency_overrides[get_order_service] = lambda: service
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-
-
-def create(client: TestClient, **overrides: Any) -> dict[str, Any]:
-    response = client.post("/orders", json={**VALID_PAYLOAD, **overrides})
+def create(
+    client: TestClient, headers: dict[str, str] | None = None, **overrides: Any
+) -> dict[str, Any]:
+    response = client.post("/orders", json={**VALID_PAYLOAD, **overrides}, headers=headers)
     assert response.status_code == 202, response.text
     return response.json()
 
@@ -156,14 +145,15 @@ def test_list_orders_defaults(client: TestClient) -> None:
     assert page == {"items": [], "total": 0, "limit": 20, "offset": 0}
 
 
-def test_list_orders_filters_by_status(client: TestClient, service: OrderService) -> None:
+def test_list_orders_filters_by_status(client: TestClient, db_session: Session) -> None:
     pending = create(client)
-    failed = service.create_order(OrderCreate(**VALID_PAYLOAD))
-    failed.status = OrderStatus.FAILED
+    failed_id = create(client)["id"]
+    db_session.get_one(Order, UUID(failed_id)).status = OrderStatus.FAILED
+    db_session.commit()
 
     page = client.get("/orders", params={"status": "FAILED"}).json()
 
-    assert [item["id"] for item in page["items"]] == [str(failed.id)]
+    assert [item["id"] for item in page["items"]] == [failed_id]
     assert page["total"] == 1
     assert pending["id"] not in {item["id"] for item in page["items"]}
 
@@ -173,5 +163,68 @@ def test_list_orders_filters_by_status(client: TestClient, service: OrderService
 )
 def test_list_orders_rejects_invalid_query(client: TestClient, params: dict[str, Any]) -> None:
     response = client.get("/orders", params=params)
+
+    assert response.status_code == 422
+
+
+# --- Idempotency-Key -------------------------------------------------------
+
+
+def count_orders(db_session: Session) -> int:
+    return db_session.scalar(select(func.count()).select_from(Order)) or 0
+
+
+def test_same_idempotency_key_and_payload_returns_original_order(
+    client: TestClient, db_session: Session
+) -> None:
+    headers = {"Idempotency-Key": "key-1"}
+    first = client.post("/orders", json=VALID_PAYLOAD, headers=headers)
+    second = client.post("/orders", json=VALID_PAYLOAD, headers=headers)
+
+    assert first.status_code == second.status_code == 202
+    assert second.json() == first.json()
+    assert "Idempotent-Replayed" not in first.headers
+    assert second.headers["Idempotent-Replayed"] == "true"
+    assert count_orders(db_session) == 1
+
+
+def test_idempotency_compares_normalized_payload(client: TestClient) -> None:
+    headers = {"Idempotency-Key": "key-1"}
+    first = create(client, headers=headers)
+    second = create(client, headers=headers, customer_id="  CLIENT-123 ")
+
+    assert second["id"] == first["id"]
+
+
+def test_same_idempotency_key_with_different_payload_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    headers = {"Idempotency-Key": "key-1"}
+    create(client, headers=headers)
+
+    response = client.post("/orders", json={**VALID_PAYLOAD, "quantity": 99}, headers=headers)
+
+    assert response.status_code == 409
+    assert count_orders(db_session) == 1
+
+
+def test_different_idempotency_keys_create_different_orders(client: TestClient) -> None:
+    first = create(client, headers={"Idempotency-Key": "key-1"})
+    second = create(client, headers={"Idempotency-Key": "key-2"})
+
+    assert first["id"] != second["id"]
+
+
+def test_requests_without_idempotency_key_are_not_deduplicated(
+    client: TestClient, db_session: Session
+) -> None:
+    create(client)
+    create(client)
+
+    assert count_orders(db_session) == 2
+
+
+def test_oversized_idempotency_key_returns_422(client: TestClient) -> None:
+    response = client.post("/orders", json=VALID_PAYLOAD, headers={"Idempotency-Key": "k" * 256})
 
     assert response.status_code == 422

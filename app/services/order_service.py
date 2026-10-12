@@ -1,28 +1,54 @@
-import threading
-from datetime import UTC, datetime
-from uuid import UUID, uuid4
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass
 
-from app.models.order import Order, OrderStatus
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.models.order import Order, OrderStatus, utc_now
 from app.schemas.order import OrderCreate
 
 
 class OrderNotFoundError(Exception):
-    def __init__(self, order_id: UUID) -> None:
+    def __init__(self, order_id: uuid.UUID) -> None:
         super().__init__(f"Order {order_id} not found")
         self.order_id = order_id
 
 
+class IdempotencyConflictError(Exception):
+    """The Idempotency-Key was already used with a different payload."""
+
+
+@dataclass(frozen=True, slots=True)
+class CreateOrderResult:
+    order: Order
+    created: bool  # False when an existing order was returned for a replayed request
+
+
+def compute_request_hash(data: OrderCreate) -> str:
+    """SHA-256 of the validated (hence normalized) payload, serialized canonically."""
+    canonical = json.dumps(data.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 class OrderService:
-    """Order business logic. Storage is in-memory until Milestone 3 (PostgreSQL)."""
+    def __init__(self, session: Session) -> None:
+        self._session = session
 
-    def __init__(self) -> None:
-        # Insertion-ordered; sync endpoints run in a thread pool, hence the lock.
-        self._orders: dict[UUID, Order] = {}
-        self._lock = threading.Lock()
+    def create_order(
+        self, data: OrderCreate, idempotency_key: str | None = None
+    ) -> CreateOrderResult:
+        request_hash = compute_request_hash(data)
 
-    def create_order(self, data: OrderCreate) -> Order:
-        order_id = uuid4()
-        now = datetime.now(UTC)
+        if idempotency_key is not None:
+            existing = self._find_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return self._replay(existing, request_hash)
+
+        order_id = uuid.uuid4()
+        now = utc_now()  # one clock read: a new order has created_at == updated_at
         order = Order(
             id=order_id,
             customer_id=data.customer_id,
@@ -30,17 +56,27 @@ class OrderService:
             quantity=data.quantity,
             # Stable identifier sent to the ERP on every attempt; never regenerated.
             external_order_id=str(order_id),
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
             status=OrderStatus.PENDING,
             created_at=now,
             updated_at=now,
         )
-        with self._lock:
-            self._orders[order.id] = order
-        return order
+        self._session.add(order)
+        try:
+            self._session.commit()
+        except IntegrityError:
+            # A concurrent request with the same key committed first: the unique
+            # constraint, not the lookup above, is what guarantees a single order.
+            self._session.rollback()
+            existing = self._find_by_idempotency_key(idempotency_key) if idempotency_key else None
+            if existing is None:
+                raise
+            return self._replay(existing, request_hash)
+        return CreateOrderResult(order=order, created=True)
 
-    def get_order(self, order_id: UUID) -> Order:
-        with self._lock:
-            order = self._orders.get(order_id)
+    def get_order(self, order_id: uuid.UUID) -> Order:
+        order = self._session.get(Order, order_id)
         if order is None:
             raise OrderNotFoundError(order_id)
         return order
@@ -49,19 +85,27 @@ class OrderService:
         self, *, status: OrderStatus | None, limit: int, offset: int
     ) -> tuple[list[Order], int]:
         """Return one page of orders (newest first) and the total matching count."""
-        with self._lock:
-            # Reverse insertion order == newest first, with no ties on equal timestamps.
-            matching = [
-                order
-                for order in reversed(self._orders.values())
-                if status is None or order.status == status
-            ]
-        return matching[offset : offset + limit], len(matching)
+        filters = [Order.status == status] if status is not None else []
+        page = self._session.scalars(
+            select(Order)
+            .where(*filters)
+            # id breaks ties so pagination is deterministic.
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+        total = self._session.scalar(select(func.count()).select_from(Order).where(*filters))
+        return list(page), total or 0
 
+    def _find_by_idempotency_key(self, idempotency_key: str) -> Order | None:
+        return self._session.scalars(
+            select(Order).where(Order.idempotency_key == idempotency_key)
+        ).one_or_none()
 
-_order_service = OrderService()
-
-
-def get_order_service() -> OrderService:
-    """FastAPI dependency; overridden in tests to get an isolated service."""
-    return _order_service
+    @staticmethod
+    def _replay(existing: Order, request_hash: str) -> CreateOrderResult:
+        if existing.request_hash != request_hash:
+            raise IdempotencyConflictError(
+                "Idempotency-Key was already used with a different request payload"
+            )
+        return CreateOrderResult(order=existing, created=False)

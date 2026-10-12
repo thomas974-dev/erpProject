@@ -1,24 +1,43 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 
+from app.api.dependencies import OrderServiceDep
 from app.models.order import OrderStatus
 from app.schemas.order import OrderAccepted, OrderCreate, OrderList, OrderRead
-from app.services.order_service import OrderNotFoundError, OrderService, get_order_service
+from app.services.order_service import IdempotencyConflictError, OrderNotFoundError
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
-OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]
 
-
-@router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=OrderAccepted)
+@router.post(
+    "",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=OrderAccepted,
+    responses={
+        status.HTTP_409_CONFLICT: {
+            "description": "Idempotency-Key already used with a different payload"
+        }
+    },
+)
 def create_order(
-    payload: OrderCreate, request: Request, response: Response, service: OrderServiceDep
+    payload: OrderCreate,
+    request: Request,
+    response: Response,
+    service: OrderServiceDep,
+    idempotency_key: Annotated[str | None, Header(min_length=1, max_length=255)] = None,
 ) -> OrderAccepted:
-    order = service.create_order(payload)
+    try:
+        result = service.create_order(payload, idempotency_key=idempotency_key)
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    order = result.order
     status_url = request.app.url_path_for("get_order", order_id=str(order.id))
     response.headers["Location"] = status_url
+    if not result.created:
+        response.headers["Idempotent-Replayed"] = "true"
     return OrderAccepted(
         id=order.id,
         status=order.status,
