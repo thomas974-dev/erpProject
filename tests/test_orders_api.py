@@ -1,0 +1,177 @@
+from collections.abc import Iterator
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.models.order import OrderStatus
+from app.schemas.order import OrderCreate
+from app.services.order_service import OrderService, get_order_service
+
+VALID_PAYLOAD = {"customer_id": "CLIENT-123", "product_id": "PRODUCT-456", "quantity": 10}
+
+
+@pytest.fixture
+def service() -> OrderService:
+    return OrderService()
+
+
+@pytest.fixture
+def client(service: OrderService) -> Iterator[TestClient]:
+    app.dependency_overrides[get_order_service] = lambda: service
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+def create(client: TestClient, **overrides: Any) -> dict[str, Any]:
+    response = client.post("/orders", json={**VALID_PAYLOAD, **overrides})
+    assert response.status_code == 202, response.text
+    return response.json()
+
+
+# --- health & docs ---------------------------------------------------------
+
+
+def test_health(client: TestClient) -> None:
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_openapi_documents_all_endpoints(client: TestClient) -> None:
+    paths = client.get("/openapi.json").json()["paths"]
+
+    assert set(paths) >= {"/health", "/orders", "/orders/{order_id}"}
+    assert client.get("/docs").status_code == 200
+
+
+# --- POST /orders ----------------------------------------------------------
+
+
+def test_create_order_returns_202_pending(client: TestClient) -> None:
+    response = client.post("/orders", json=VALID_PAYLOAD)
+
+    assert response.status_code == 202
+    body = response.json()
+    order_id = UUID(body["id"])
+    assert body["status"] == "PENDING"
+    assert body["external_order_id"]
+    assert body["status_url"] == f"/orders/{order_id}"
+    assert response.headers["Location"] == body["status_url"]
+
+
+def test_create_order_trims_whitespace(client: TestClient) -> None:
+    body = create(client, customer_id="  CLIENT-123  ")
+
+    order = client.get(body["status_url"]).json()
+    assert order["customer_id"] == "CLIENT-123"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {**VALID_PAYLOAD, "quantity": 0},
+        {**VALID_PAYLOAD, "quantity": -1},
+        {**VALID_PAYLOAD, "quantity": 1.5},
+        {**VALID_PAYLOAD, "quantity": "10"},
+        {**VALID_PAYLOAD, "quantity": True},
+        {**VALID_PAYLOAD, "customer_id": ""},
+        {**VALID_PAYLOAD, "product_id": "   "},
+        {**VALID_PAYLOAD, "unexpected": "field"},
+        {"product_id": "PRODUCT-456", "quantity": 10},
+        {"customer_id": "CLIENT-123", "product_id": "PRODUCT-456"},
+    ],
+    ids=[
+        "zero-quantity",
+        "negative-quantity",
+        "float-quantity",
+        "string-quantity",
+        "bool-quantity",
+        "empty-customer",
+        "blank-product",
+        "extra-field",
+        "missing-customer",
+        "missing-quantity",
+    ],
+)
+def test_create_order_rejects_invalid_payload(client: TestClient, payload: dict[str, Any]) -> None:
+    response = client.post("/orders", json=payload)
+
+    assert response.status_code == 422
+
+
+# --- GET /orders/{id} ------------------------------------------------------
+
+
+def test_get_order_returns_all_fields(client: TestClient) -> None:
+    created = create(client)
+
+    response = client.get(created["status_url"])
+
+    assert response.status_code == 200
+    order = response.json()
+    assert order["id"] == created["id"]
+    assert order["quantity"] == 10
+    assert order["status"] == "PENDING"
+    assert order["erp_order_id"] is None
+    assert order["attempt_count"] == 0
+    assert order["last_error"] is None
+    assert order["created_at"] == order["updated_at"]
+
+
+def test_get_unknown_order_returns_404(client: TestClient) -> None:
+    response = client.get(f"/orders/{uuid4()}")
+
+    assert response.status_code == 404
+
+
+def test_get_order_with_malformed_id_returns_422(client: TestClient) -> None:
+    response = client.get("/orders/not-a-uuid")
+
+    assert response.status_code == 422
+
+
+# --- GET /orders -----------------------------------------------------------
+
+
+def test_list_orders_newest_first_with_pagination(client: TestClient) -> None:
+    ids = [create(client, quantity=q)["id"] for q in (1, 2, 3)]
+
+    page = client.get("/orders", params={"limit": 2, "offset": 0}).json()
+
+    assert [item["id"] for item in page["items"]] == [ids[2], ids[1]]
+    assert (page["total"], page["limit"], page["offset"]) == (3, 2, 0)
+
+    next_page = client.get("/orders", params={"limit": 2, "offset": 2}).json()
+    assert [item["id"] for item in next_page["items"]] == [ids[0]]
+
+
+def test_list_orders_defaults(client: TestClient) -> None:
+    page = client.get("/orders").json()
+
+    assert page == {"items": [], "total": 0, "limit": 20, "offset": 0}
+
+
+def test_list_orders_filters_by_status(client: TestClient, service: OrderService) -> None:
+    pending = create(client)
+    failed = service.create_order(OrderCreate(**VALID_PAYLOAD))
+    failed.status = OrderStatus.FAILED
+
+    page = client.get("/orders", params={"status": "FAILED"}).json()
+
+    assert [item["id"] for item in page["items"]] == [str(failed.id)]
+    assert page["total"] == 1
+    assert pending["id"] not in {item["id"] for item in page["items"]}
+
+
+@pytest.mark.parametrize(
+    "params", [{"limit": 101}, {"limit": 0}, {"offset": -1}, {"status": "DONE"}]
+)
+def test_list_orders_rejects_invalid_query(client: TestClient, params: dict[str, Any]) -> None:
+    response = client.get("/orders", params=params)
+
+    assert response.status_code == 422
