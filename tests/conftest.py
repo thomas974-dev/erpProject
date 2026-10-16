@@ -1,8 +1,12 @@
 """Shared fixtures: a dedicated PostgreSQL test database, migrated with Alembic."""
 
+import socket
+import threading
+import time
 from collections.abc import Iterator
 
 import pytest
+import uvicorn
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
@@ -13,6 +17,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.main import app
+from mock_erp.failures import FailureInjector
+from mock_erp.main import app as erp_app
+from mock_erp.main import failure_injector
 
 
 def _test_database_url() -> URL:
@@ -58,7 +65,7 @@ def db_engine(alembic_config: Config) -> Iterator[Engine]:
 @pytest.fixture
 def session_factory(db_engine: Engine) -> sessionmaker[Session]:
     with db_engine.begin() as connection:
-        connection.execute(text("TRUNCATE TABLE orders"))
+        connection.execute(text("TRUNCATE TABLE orders, erp_orders"))
     return sessionmaker(bind=db_engine, expire_on_commit=False)
 
 
@@ -78,3 +85,79 @@ def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+# --- Mock ERP ------------------------------------------------------------------
+
+
+@pytest.fixture
+def erp_failures() -> Iterator[FailureInjector]:
+    """The mock ERP's failure injector, reset to `normal` before and after each test."""
+    failure_injector.reset()
+    yield failure_injector
+    failure_injector.reset()
+
+
+@pytest.fixture
+def erp_api(
+    session_factory: sessionmaker[Session], erp_failures: FailureInjector
+) -> Iterator[TestClient]:
+    """In-process client for the mock ERP app (no real network)."""
+
+    def override_get_db() -> Iterator[Session]:
+        with session_factory() as session:
+            yield session
+
+    # Restore (not clear) afterwards: the session-scoped server relies on its own override.
+    previous = dict(erp_app.dependency_overrides)
+    erp_app.dependency_overrides[get_db] = override_get_db
+    with TestClient(erp_app) as test_client:
+        yield test_client
+    erp_app.dependency_overrides.clear()
+    erp_app.dependency_overrides.update(previous)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def mock_erp_server(db_engine: Engine) -> Iterator[str]:
+    """The mock ERP served by a real uvicorn in a background thread: real sockets, real
+    timeouts. Yields its base URL."""
+    test_sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
+
+    def override_get_db() -> Iterator[Session]:
+        with test_sessions() as session:
+            yield session
+
+    erp_app.dependency_overrides[get_db] = override_get_db
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(erp_app, host="127.0.0.1", port=port, log_level="warning")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started:
+        if time.monotonic() > deadline:
+            raise RuntimeError("mock ERP server did not start")
+        time.sleep(0.01)
+
+    yield f"http://127.0.0.1:{port}"
+
+    server.should_exit = True
+    thread.join(timeout=5)
+    erp_app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def erp_base_url(
+    mock_erp_server: str,
+    session_factory: sessionmaker[Session],
+    erp_failures: FailureInjector,
+) -> str:
+    """Base URL of the running mock ERP, with empty tables and `normal` mode."""
+    return mock_erp_server

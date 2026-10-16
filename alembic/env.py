@@ -5,7 +5,8 @@ from sqlalchemy import engine_from_config, pool
 
 from app.core.config import get_settings
 from app.core.database import Base
-from app.models import order  # noqa: F401  (registers the model on Base.metadata)
+from app.models import order  # noqa: F401  (registers models on Base.metadata)
+from mock_erp import models as erp_models  # noqa: F401
 
 config = context.config
 
