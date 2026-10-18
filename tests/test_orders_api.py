@@ -3,9 +3,12 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from kombu.exceptions import OperationalError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import get_order_dispatcher
+from app.main import app
 from app.models.order import Order, OrderStatus
 
 pytestmark = pytest.mark.integration
@@ -228,3 +231,36 @@ def test_oversized_idempotency_key_returns_422(client: TestClient) -> None:
     response = client.post("/orders", json=VALID_PAYLOAD, headers={"Idempotency-Key": "k" * 256})
 
     assert response.status_code == 422
+
+
+# --- Background processing is scheduled -----------------------------------------
+
+
+def test_create_order_schedules_processing_once(client: TestClient, dispatched: list[UUID]) -> None:
+    created = create(client)
+
+    assert dispatched == [UUID(created["id"])]
+
+
+def test_replayed_request_does_not_schedule_a_second_task(
+    client: TestClient, dispatched: list[UUID]
+) -> None:
+    headers = {"Idempotency-Key": "key-1"}
+    create(client, headers=headers)
+    create(client, headers=headers)
+
+    assert len(dispatched) == 1
+
+
+def test_broker_failure_still_returns_202_and_keeps_the_order(
+    client: TestClient, db_session: Session
+) -> None:
+    def broken_dispatch(order_id: UUID) -> None:
+        raise OperationalError("Redis is down")
+
+    app.dependency_overrides[get_order_dispatcher] = lambda: broken_dispatch
+
+    response = client.post("/orders", json=VALID_PAYLOAD)
+
+    assert response.status_code == 202
+    assert count_orders(db_session) == 1  # persisted, stays PENDING (documented limitation)

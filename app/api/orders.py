@@ -1,12 +1,16 @@
+import logging
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
+from kombu.exceptions import OperationalError as BrokerError
 
-from app.api.dependencies import OrderServiceDep
+from app.api.dependencies import OrderDispatcherDep, OrderServiceDep
 from app.models.order import OrderStatus
 from app.schemas.order import OrderAccepted, OrderCreate, OrderList, OrderRead
 from app.services.order_service import IdempotencyConflictError, OrderNotFoundError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -26,6 +30,7 @@ def create_order(
     request: Request,
     response: Response,
     service: OrderServiceDep,
+    dispatch: OrderDispatcherDep,
     idempotency_key: Annotated[str | None, Header(min_length=1, max_length=255)] = None,
 ) -> OrderAccepted:
     try:
@@ -34,6 +39,13 @@ def create_order(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     order = result.order
+    if result.created:  # a replayed request must not schedule a second task
+        try:
+            dispatch(order.id)
+        except BrokerError:
+            # Known MVP limitation (no outbox): the order is committed but not queued and
+            # stays PENDING until a recovery mechanism re-publishes it. See README.
+            logger.exception("event=order_enqueue_failed order_id=%s", order.id)
     status_url = request.app.url_path_for("get_order", order_id=str(order.id))
     response.headers["Location"] = status_url
     if not result.created:

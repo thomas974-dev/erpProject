@@ -3,6 +3,7 @@
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 
 import pytest
@@ -14,6 +15,7 @@ from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.api.dependencies import get_order_dispatcher
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.main import app
@@ -76,12 +78,21 @@ def db_session(session_factory: sessionmaker[Session]) -> Iterator[Session]:
 
 
 @pytest.fixture
-def client(session_factory: sessionmaker[Session]) -> Iterator[TestClient]:
+def dispatched() -> list[uuid.UUID]:
+    """Order IDs the API scheduled for processing (instead of publishing to Redis)."""
+    return []
+
+
+@pytest.fixture
+def client(
+    session_factory: sessionmaker[Session], dispatched: list[uuid.UUID]
+) -> Iterator[TestClient]:
     def override_get_db() -> Iterator[Session]:
         with session_factory() as session:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_order_dispatcher] = lambda: dispatched.append
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

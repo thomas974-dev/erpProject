@@ -24,6 +24,17 @@ http://127.0.0.1:8000/docs (Swagger UI).
 Run the mock ERP: `uv run uvicorn mock_erp.main:app --reload --port 8001`
 (docs at http://127.0.0.1:8001/docs).
 
+Run the worker: `uv run celery -A app.workers.celery_app:celery_app worker --loglevel=info`
+(thread pool by default: tasks are I/O-bound, and Celery's prefork pool currently fails on
+macOS because billiard starts children with `spawn` there).
+
+### Known limitation: committed but not queued
+
+Saving the order and publishing the Celery message are two separate writes (no outbox).
+If Redis is unreachable, `POST /orders` still returns `202` (the order is safely stored) and
+logs `event=order_enqueue_failed`, but the order stays `PENDING` until it is re-published.
+Fix in a later iteration: transactional outbox or a periodic sweep of stale `PENDING` orders.
+
 ### Mock ERP failure injection (development only)
 
 Applies to `POST /erp/orders`. Modes: `normal`, `http_400`, `http_429`, `http_503`,
