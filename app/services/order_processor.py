@@ -11,12 +11,14 @@ import random
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Self
 
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.logging import log_event
 from app.integrations.erp_client import (
     ErpClient,
     ErpError,
@@ -28,6 +30,17 @@ from app.integrations.erp_client import (
 from app.models.order import Order, OrderStatus, utc_now
 
 logger = logging.getLogger(__name__)
+
+
+class ErrorCategory(StrEnum):
+    """Logged with every failure, so incidents can be grouped by cause."""
+
+    TRANSIENT = "transient"  # certainly not processed; retried automatically
+    PERMANENT = "permanent"  # rejected by the ERP; needs a human
+    UNCERTAIN = "uncertain"  # may have been processed; reconciled before any re-send
+    RECONCILIATION = "reconciliation"  # lookup failed; still uncertain
+    DATA_MISMATCH = "data_mismatch"  # ERP holds different data for this external id
+    UNEXPECTED = "unexpected"  # bug in the worker
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +95,7 @@ class OrderProcessor:
         order = self._claim(order_id)
         if order is None:
             # Unknown id, or already claimed/processed (e.g. a redelivered message).
-            logger.info("event=order_not_claimed order_id=%s", order_id)
+            log_event(logger, "order_not_claimed", order_id=order_id)
             return None
         try:
             if order.needs_reconciliation:
@@ -93,7 +106,12 @@ class OrderProcessor:
         except Exception:
             # A bug, possibly after the ERP call succeeded: UNKNOWN, never FAILED.
             self._session.rollback()
-            self._finish(order, OrderStatus.UNKNOWN, error="Unexpected worker error")
+            self._finish(
+                order,
+                OrderStatus.UNKNOWN,
+                error="Unexpected worker error",
+                category=ErrorCategory.UNEXPECTED,
+            )
             raise
 
     def _claim(self, order_id: uuid.UUID) -> Order | None:
@@ -128,6 +146,7 @@ class OrderProcessor:
                 order,
                 OrderStatus.UNKNOWN,
                 error=f"Reconciliation failed: {exc}",
+                category=ErrorCategory.RECONCILIATION,
                 retry_in=self._next_retry_delay(order, retry_after),
             )  # needs_reconciliation stays True
 
@@ -139,6 +158,7 @@ class OrderProcessor:
                 order,
                 OrderStatus.FAILED,
                 error="ERP holds a different order under this external_order_id",
+                category=ErrorCategory.DATA_MISMATCH,
             )  # needs_reconciliation stays True: a manual retry must check again
         self._log("erp_reconciled_found", order)
         return self._finish(
@@ -163,7 +183,11 @@ class OrderProcessor:
         except ErpPermanentError as exc:
             # The ERP answered and rejected the order: certainly not created.
             return self._finish(
-                order, OrderStatus.FAILED, error=str(exc), needs_reconciliation=False
+                order,
+                OrderStatus.FAILED,
+                error=str(exc),
+                category=ErrorCategory.PERMANENT,
+                needs_reconciliation=False,
             )
         except ErpTransientError as exc:
             # Not sent, or explicitly not processed (429/503): certainly not created.
@@ -173,12 +197,14 @@ class OrderProcessor:
                     order,
                     OrderStatus.FAILED,
                     error=f"{exc} (gave up after {order.attempt_count} attempts)",
+                    category=ErrorCategory.TRANSIENT,
                     needs_reconciliation=False,
                 )
             return self._finish(
                 order,
                 OrderStatus.PENDING,
                 error=str(exc),
+                category=ErrorCategory.TRANSIENT,
                 retry_in=retry_in,
                 needs_reconciliation=False,
             )
@@ -188,6 +214,7 @@ class OrderProcessor:
                 order,
                 OrderStatus.UNKNOWN,
                 error=str(exc),
+                category=ErrorCategory.UNCERTAIN,
                 retry_in=self._next_retry_delay(order),
             )  # needs_reconciliation stays True
         return self._finish(
@@ -209,6 +236,7 @@ class OrderProcessor:
         *,
         erp_order_id: str | None = None,
         error: str | None = None,
+        category: ErrorCategory | None = None,
         retry_in: float | None = None,
         needs_reconciliation: bool | None = None,  # None: leave unchanged
     ) -> ProcessOutcome:
@@ -226,20 +254,20 @@ class OrderProcessor:
             status=status,
             retry_in=None if retry_in is None else round(retry_in, 3),
             error=error,
+            error_category=category,
         )
         return ProcessOutcome(status=status, retry_in=retry_in)
 
     @staticmethod
     def _log(event: str, order: Order, level: int = logging.INFO, **fields: object) -> None:
-        extra = "".join(f" {key}={value}" for key, value in fields.items())
-        logger.log(
-            level,
-            "event=%s order_id=%s external_order_id=%s attempt=%d%s",
+        log_event(
+            logger,
             event,
-            order.id,
-            order.external_order_id,
-            order.attempt_count,
-            extra,
+            level=level,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            attempt=order.attempt_count,
+            **fields,
         )
 
 

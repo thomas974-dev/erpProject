@@ -21,7 +21,11 @@ class Base(DeclarativeBase):
 
 # Connections are opened lazily, on first use. pool_pre_ping discards stale connections
 # (e.g. after a PostgreSQL restart) instead of failing the request.
-engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+engine = create_engine(
+    get_settings().database_url,
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": 5},  # fail fast if PostgreSQL is unreachable
+)
 
 # expire_on_commit=False: objects stay readable after commit without an extra SELECT.
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

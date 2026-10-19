@@ -1,5 +1,6 @@
 """OrderProcessor and the Celery task, against the test database and the real mock ERP."""
 
+import json
 import logging
 import threading
 import uuid
@@ -12,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
+from app.core.logging import JsonFormatter
 from app.integrations.erp_client import ErpClient, ErpOrder, ErpTransientError
 from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderCreate
@@ -408,9 +410,35 @@ def test_credentials_never_reach_logs_or_last_error(
 
     order = load(session_factory, order_id)
     assert order.status == OrderStatus.FAILED
-    assert "s3cr3t-token" not in caplog.text
+    output = "\n".join(JsonFormatter().format(record) for record in caplog.records)
+    assert "s3cr3t-token" not in output
     assert "s3cr3t-token" not in (order.last_error or "")
-    assert "event=order_finished" in caplog.text
+
+
+def test_finished_events_carry_the_required_fields(
+    session_factory: sessionmaker[Session],
+    erp: SpyErpClient,
+    erp_failures: FailureInjector,
+    order_id: uuid.UUID,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    set_mode(erp_failures, mode="http_400")
+
+    with caplog.at_level(logging.INFO, logger="app.services.order_processor"):
+        process(session_factory, erp, order_id)
+
+    finished = json.loads(
+        JsonFormatter().format(
+            next(r for r in caplog.records if getattr(r, "event", None) == "order_finished")
+        )
+    )
+    assert finished["level"] == "WARNING"
+    assert finished["order_id"] == str(order_id)
+    assert finished["external_order_id"] == str(order_id)
+    assert finished["attempt"] == 1
+    assert finished["status"] == "FAILED"
+    assert finished["error_category"] == "permanent"
+    assert finished["error"].startswith("ERP returned HTTP 400")
 
 
 # --- the Celery task ------------------------------------------------------------------------

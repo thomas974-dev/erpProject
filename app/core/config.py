@@ -19,6 +19,8 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    log_level: str = "INFO"
+
     database_url: str = "postgresql+psycopg://orders:orders@127.0.0.1:5432/orders"
     celery_broker_url: str = "redis://127.0.0.1:6379/0"
 

@@ -1,6 +1,10 @@
+from typing import Any
+
 from celery import Celery
+from celery.signals import setup_logging
 
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 
 celery_app = Celery(
     "order_to_erp",
@@ -27,3 +31,10 @@ celery_app.conf.update(
     task_publish_retry_policy={"max_retries": 2, "interval_start": 0, "interval_step": 0.2},
     broker_connection_retry_on_startup=True,
 )
+
+
+@setup_logging.connect
+def _configure_logging(**_: Any) -> None:
+    # Connecting this signal stops Celery from installing its own handlers: worker and
+    # Celery internals then log JSON lines like the API.
+    configure_logging(get_settings().log_level)

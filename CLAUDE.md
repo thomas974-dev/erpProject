@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Pre-implementation: the only source of truth is `PRD.md` (Order-to-ERP Integration Simulator, a portfolio project). Treat it as authoritative, implement its milestones (§10) **in order**, and don't build "future enhancements" (§13) until MVP acceptance criteria (§11–12) pass. Before each milestone, state the files to change and the verification commands; after it, run tests + lint and summarize what works and what remains. When something is underspecified, pick the simplest safe approach and document the tradeoff in README.
+All PRD milestones (§10) are implemented; `PRD.md` remains the source of truth and `README.md` documents setup, the state machine, reliability design, troubleshooting and known limitations (keep it in sync). Don't build "future enhancements" (§13) unless asked. Before each milestone, state the files to change and the verification commands; after it, run tests + lint and summarize what works and what remains. When something is underspecified, pick the simplest safe approach and document the tradeoff in README.
 
-## Commands (planned stack: Python 3.12 + uv)
+## Commands (Python 3.12 + uv)
 
 ```bash
 docker compose up -d                       # PostgreSQL 16 + Redis 7 (bind to 127.0.0.1 only)
@@ -17,7 +17,8 @@ uv run celery -A app.workers.celery_app:celery_app worker --loglevel=info
 
 uv run pytest                              # all tests
 uv run pytest tests/test_worker.py::test_name   # single test
-uv run ruff check .                        # lint (must pass along with pytest)
+uv run ruff check . && uv run ruff format --check .   # lint (must pass along with pytest)
+uv run python scripts/demo.py              # smoke test: 4 scenarios against the 3 running processes
 ```
 
 Config comes from `.env` via pydantic-settings; `.env.example` must define `DATABASE_URL`, `CELERY_BROKER_URL`, `ERP_BASE_URL`, `ERP_HTTP_TIMEOUT_SECONDS`, `ERP_MAX_ATTEMPTS`, and the mock ERP failure mode.
@@ -39,7 +40,8 @@ Key design rules that span multiple modules:
 - **Client idempotency**: optional `Idempotency-Key` header, unique at DB level, paired with a `request_hash` of the normalized payload. Same key + same payload → original order (no second task); different payload → `409`.
 - **Mock ERP failure modes** (dev-only): `normal`, `http_503`, `http_429`, `http_400`, `timeout_before_create`, `timeout_after_create` (must commit the ERP order *before* sleeping past the client timeout).
 - Known MVP limitation to document, not silently "fix": DB commit and Celery publish aren't atomic (no outbox), so a crash can strand a `PENDING` order. Don't claim exactly-once.
-- Structured logs include `order_id`, `external_order_id`, `attempt`, `event`, error category; `last_error` is sanitized; never log secrets.
+- Logs are JSON lines (`app/core/logging.py`, configured in `app/main.py` and via Celery's `setup_logging` signal). Log with `log_event(logger, "event_name", order_id=..., ...)`, not formatted strings; fields become JSON keys. Failures carry `error_category` (`ErrorCategory` in `order_processor.py`). The formatter masks `scheme://user:pass@`; `last_error` stays sanitized; never log secrets.
+- `/health` is liveness only; `/ready` checks PostgreSQL and Redis (checks injectable via `get_readiness_checks`).
 
 ## Testing
 

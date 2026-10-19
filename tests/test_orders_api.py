@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.dependencies import get_order_dispatcher
+from app.api.health import get_readiness_checks
 from app.main import app
 from app.models.order import Order, OrderStatus
 from app.services.order_service import OrderNotRetryableError, OrderService
@@ -37,10 +38,42 @@ def test_health(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_ready_when_database_and_broker_answer(client: TestClient) -> None:
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "checks": {"database": "ok", "broker": "ok"}}
+
+
+def test_not_ready_when_a_dependency_is_down(client: TestClient) -> None:
+    def broker_down() -> None:
+        raise ConnectionError("Error 61 connecting to 127.0.0.1:6379")
+
+    app.dependency_overrides[get_readiness_checks] = lambda: {
+        "database": lambda: None,
+        "broker": broker_down,
+    }
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "checks": {"database": "ok", "broker": "unavailable"},
+    }
+    assert "6379" not in response.text  # internal details stay in the logs
+
+
 def test_openapi_documents_all_endpoints(client: TestClient) -> None:
     paths = client.get("/openapi.json").json()["paths"]
 
-    assert set(paths) >= {"/health", "/orders", "/orders/{order_id}"}
+    assert set(paths) >= {
+        "/health",
+        "/ready",
+        "/orders",
+        "/orders/{order_id}",
+        "/orders/{order_id}/retry",
+    }
     assert client.get("/docs").status_code == 200
 
 

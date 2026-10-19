@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, 
 from kombu.exceptions import OperationalError as BrokerError
 
 from app.api.dependencies import OrderDispatcher, OrderDispatcherDep, OrderServiceDep
+from app.core.logging import log_event
 from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderAccepted, OrderCreate, OrderList, OrderRead
 from app.services.order_service import (
@@ -25,7 +26,9 @@ def schedule_processing(dispatch: OrderDispatcher, order_id: UUID) -> None:
     except BrokerError:
         # Known MVP limitation (no outbox): the order is committed but not queued and
         # stays PENDING until a recovery mechanism re-publishes it. See README.
-        logger.exception("event=order_enqueue_failed order_id=%s", order_id)
+        log_event(
+            logger, "order_enqueue_failed", level=logging.ERROR, exc_info=True, order_id=order_id
+        )
 
 
 def accepted(request: Request, response: Response, order: Order) -> OrderAccepted:
@@ -63,8 +66,15 @@ def create_order(
     except IdempotencyConflictError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
+    order = result.order
+    log_event(
+        logger,
+        "order_created" if result.created else "order_create_replayed",
+        order_id=order.id,
+        external_order_id=order.external_order_id,
+    )
     if result.created:  # a replayed request must not schedule a second task
-        schedule_processing(dispatch, result.order.id)
+        schedule_processing(dispatch, order.id)
     else:
         response.headers["Idempotent-Replayed"] = "true"
     return accepted(request, response, result.order)
@@ -93,6 +103,13 @@ def retry_order(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except OrderNotRetryableError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    log_event(
+        logger,
+        "order_retry_requested",
+        order_id=order.id,
+        external_order_id=order.external_order_id,
+        attempt=order.attempt_count,
+    )
     schedule_processing(dispatch, order.id)
     return accepted(request, response, order)
 
