@@ -5,14 +5,39 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from kombu.exceptions import OperationalError as BrokerError
 
-from app.api.dependencies import OrderDispatcherDep, OrderServiceDep
-from app.models.order import OrderStatus
+from app.api.dependencies import OrderDispatcher, OrderDispatcherDep, OrderServiceDep
+from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderAccepted, OrderCreate, OrderList, OrderRead
-from app.services.order_service import IdempotencyConflictError, OrderNotFoundError
+from app.services.order_service import (
+    IdempotencyConflictError,
+    OrderNotFoundError,
+    OrderNotRetryableError,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+
+
+def schedule_processing(dispatch: OrderDispatcher, order_id: UUID) -> None:
+    try:
+        dispatch(order_id)
+    except BrokerError:
+        # Known MVP limitation (no outbox): the order is committed but not queued and
+        # stays PENDING until a recovery mechanism re-publishes it. See README.
+        logger.exception("event=order_enqueue_failed order_id=%s", order_id)
+
+
+def accepted(request: Request, response: Response, order: Order) -> OrderAccepted:
+    status_url = request.app.url_path_for("get_order", order_id=str(order.id))
+    response.headers["Location"] = status_url
+    return OrderAccepted(
+        id=order.id,
+        status=order.status,
+        external_order_id=order.external_order_id,
+        created_at=order.created_at,
+        status_url=status_url,
+    )
 
 
 @router.post(
@@ -38,25 +63,38 @@ def create_order(
     except IdempotencyConflictError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    order = result.order
     if result.created:  # a replayed request must not schedule a second task
-        try:
-            dispatch(order.id)
-        except BrokerError:
-            # Known MVP limitation (no outbox): the order is committed but not queued and
-            # stays PENDING until a recovery mechanism re-publishes it. See README.
-            logger.exception("event=order_enqueue_failed order_id=%s", order.id)
-    status_url = request.app.url_path_for("get_order", order_id=str(order.id))
-    response.headers["Location"] = status_url
-    if not result.created:
+        schedule_processing(dispatch, result.order.id)
+    else:
         response.headers["Idempotent-Replayed"] = "true"
-    return OrderAccepted(
-        id=order.id,
-        status=order.status,
-        external_order_id=order.external_order_id,
-        created_at=order.created_at,
-        status_url=status_url,
-    )
+    return accepted(request, response, result.order)
+
+
+@router.post(
+    "/{order_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=OrderAccepted,
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "Order not found"},
+        status.HTTP_409_CONFLICT: {"description": "Only FAILED or UNKNOWN orders can be retried"},
+    },
+)
+def retry_order(
+    order_id: UUID,
+    request: Request,
+    response: Response,
+    service: OrderServiceDep,
+    dispatch: OrderDispatcherDep,
+) -> OrderAccepted:
+    """Manual retry: the worker reconciles with the ERP before any new create call."""
+    try:
+        order = service.retry_order(order_id)
+    except OrderNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except OrderNotRetryableError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    schedule_processing(dispatch, order.id)
+    return accepted(request, response, order)
 
 
 @router.get("", response_model=OrderList)

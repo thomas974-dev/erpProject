@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     erp_base_url: str = "http://127.0.0.1:8001"
     erp_http_timeout_seconds: float = Field(default=2.0, gt=0)
     erp_max_attempts: int = Field(default=3, ge=1)
+    # Exponential backoff with full jitter between automatic attempts.
+    erp_retry_base_delay_seconds: float = Field(default=1.0, ge=0)
+    erp_retry_max_delay_seconds: float = Field(default=30.0, ge=0)
 
     # Mock ERP only (development/testing).
     mock_erp_failure_mode: ErpFailureMode = "normal"

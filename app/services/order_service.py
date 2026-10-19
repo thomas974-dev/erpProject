@@ -3,11 +3,11 @@ import json
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.order import Order, OrderStatus, utc_now
+from app.models.order import RETRYABLE_STATUSES, Order, OrderStatus, utc_now
 from app.schemas.order import OrderCreate
 
 
@@ -19,6 +19,12 @@ class OrderNotFoundError(Exception):
 
 class IdempotencyConflictError(Exception):
     """The Idempotency-Key was already used with a different payload."""
+
+
+class OrderNotRetryableError(Exception):
+    def __init__(self, order_id: uuid.UUID, status: OrderStatus) -> None:
+        super().__init__(f"Order {order_id} is {status}; only FAILED or UNKNOWN can be retried")
+        self.status = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +85,21 @@ class OrderService:
         order = self._session.get(Order, order_id)
         if order is None:
             raise OrderNotFoundError(order_id)
+        return order
+
+    def retry_order(self, order_id: uuid.UUID) -> Order:
+        """Move a FAILED/UNKNOWN order back to PENDING. Atomic: when two retry requests race,
+        exactly one wins, so at most one new task is scheduled."""
+        order = self._session.scalars(
+            update(Order)
+            .where(Order.id == order_id, Order.status.in_(RETRYABLE_STATUSES))
+            .values(status=OrderStatus.PENDING, updated_at=utc_now())
+            .returning(Order)
+        ).one_or_none()
+        self._session.commit()
+        if order is None:
+            current = self.get_order(order_id)  # raises OrderNotFoundError
+            raise OrderNotRetryableError(order_id, current.status)
         return order
 
     def list_orders(

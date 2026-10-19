@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -5,11 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 from kombu.exceptions import OperationalError
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.dependencies import get_order_dispatcher
 from app.main import app
 from app.models.order import Order, OrderStatus
+from app.services.order_service import OrderNotRetryableError, OrderService
 
 pytestmark = pytest.mark.integration
 
@@ -264,3 +267,88 @@ def test_broker_failure_still_returns_202_and_keeps_the_order(
 
     assert response.status_code == 202
     assert count_orders(db_session) == 1  # persisted, stays PENDING (documented limitation)
+
+
+# --- POST /orders/{id}/retry -----------------------------------------------------
+
+
+def set_status(db_session: Session, order_id: str, status: OrderStatus) -> None:
+    db_session.get_one(Order, UUID(order_id)).status = status
+    db_session.commit()
+
+
+@pytest.mark.parametrize("status", [OrderStatus.FAILED, OrderStatus.UNKNOWN])
+def test_retry_failed_or_unknown_order(
+    client: TestClient, db_session: Session, dispatched: list[UUID], status: OrderStatus
+) -> None:
+    created = create(client)
+    set_status(db_session, created["id"], status)
+    dispatched.clear()
+
+    response = client.post(f"/orders/{created['id']}/retry")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "PENDING"
+    assert body["external_order_id"] == created["external_order_id"]  # never regenerated
+    assert response.headers["Location"] == created["status_url"]
+    assert dispatched == [UUID(created["id"])]
+
+
+@pytest.mark.parametrize(
+    "status", [OrderStatus.SUCCESS, OrderStatus.PENDING, OrderStatus.PROCESSING]
+)
+def test_retry_is_rejected_for_other_states(
+    client: TestClient, db_session: Session, dispatched: list[UUID], status: OrderStatus
+) -> None:
+    created = create(client)
+    set_status(db_session, created["id"], status)
+    dispatched.clear()
+
+    response = client.post(f"/orders/{created['id']}/retry")
+
+    assert response.status_code == 409
+    assert status in response.json()["detail"]
+    assert dispatched == []  # e.g. a SUCCESS order can never be sent twice
+
+
+def test_retry_unknown_order_returns_404(client: TestClient) -> None:
+    assert client.post(f"/orders/{uuid4()}/retry").status_code == 404
+
+
+def test_double_click_on_retry_schedules_a_single_task(
+    client: TestClient, db_session: Session, dispatched: list[UUID]
+) -> None:
+    created = create(client)
+    set_status(db_session, created["id"], OrderStatus.FAILED)
+    dispatched.clear()
+
+    first = client.post(f"/orders/{created['id']}/retry")
+    second = client.post(f"/orders/{created['id']}/retry")
+
+    assert (first.status_code, second.status_code) == (202, 409)
+    assert len(dispatched) == 1
+
+
+def test_concurrent_retries_have_exactly_one_winner(
+    session_factory: sessionmaker[Session], db_session: Session, client: TestClient
+) -> None:
+    """Two sessions race on the conditional UPDATE; PostgreSQL lets only one through."""
+    order_id = UUID(create(client)["id"])
+    set_status(db_session, str(order_id), OrderStatus.FAILED)
+    barrier = threading.Barrier(2)
+
+    def retry(_: int) -> str:
+        with session_factory() as session:
+            service = OrderService(session)
+            barrier.wait()
+            try:
+                service.retry_order(order_id)
+                return "accepted"
+            except OrderNotRetryableError:
+                return "rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = sorted(pool.map(retry, range(2)))
+
+    assert results == ["accepted", "rejected"]
