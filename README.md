@@ -140,12 +140,13 @@ fail?" but "could the ERP have acted?":
 
 | Outcome of `POST /erp/orders` | Category | Worker action |
 |---|---|---|
-| 2xx | success | `SUCCESS`, store `erp_order_id` |
+| 200, 201 | success | `SUCCESS`, store `erp_order_id` |
 | 400, 409, 422 | permanent | `FAILED`, no automatic retry |
 | 429, 503, connection refused / connect timeout | transient (certainly not processed) | `PENDING`, retry with backoff |
-| read timeout, connection dropped, 500/502/504, malformed 2xx body | **uncertain** | `UNKNOWN`, reconcile before any re-send |
+| read timeout, connection dropped, other 2xx, 500/502/504, malformed 200/201 body | **uncertain** | `UNKNOWN`, reconcile before any re-send |
 
-A lookup (`GET`) has no side effect, so all of its failures are transient.
+A lookup (`GET`) has no side effect: `404` means absent, and any failure (transport error,
+5xx, unexpected 4xx) leaves the order `UNKNOWN` with reconciliation still pending.
 
 **No duplicate ERP orders**, by four independent layers:
 
@@ -166,8 +167,9 @@ A lookup (`GET`) has no side effect, so all of its failures are transient.
 
 **Retries.** Up to `ERP_MAX_ATTEMPTS` (default 3), exponential backoff with full jitter
 (`random(0, min(max, base × 2^(attempt−1)))`), `Retry-After` honoured up to the cap. The task
-re-enqueues itself with a Celery `countdown`. A manual retry is a single operator-triggered
-attempt; two simultaneous retry requests yield one `202`, one `409` and a single task.
+re-enqueues itself with a Celery `countdown`. A manual retry does not reset `attempt_count`:
+it gets at least one attempt, plus any automatic retries left in the budget. Two simultaneous
+retry requests yield one `202`, one `409` and a single task.
 
 ## Observability
 
@@ -183,7 +185,7 @@ ERP `detail`.
 ```
 
 Events: `order_created`, `order_create_replayed`, `order_enqueue_failed`,
-`order_retry_requested` (API); `erp_create_attempt`, `erp_reconciled_found`,
+`order_retry_requested`, `readiness_check_failed` (API); `erp_create_attempt`, `erp_reconciled_found`,
 `erp_reconciled_absent`, `order_not_claimed`, `order_finished` (worker).
 The full history of one order: `grep <order_id>` across the API and worker logs.
 
@@ -268,7 +270,8 @@ New migration after changing a model: `uv run alembic revision --autogenerate -m
 - **Thread pool for the worker.** Tasks are I/O-bound (HTTP + SQL, the GIL is released while
   waiting). Celery's prefork pool also currently fails on macOS, where billiard starts
   children with `spawn` (celery#9894).
-- **Manual retry gives a single attempt**, not a fresh automatic budget (simplest safe choice).
+- **Manual retry does not reset the attempt budget** (simplest safe choice): it always gets
+  one attempt, and only the automatic retries left over from `ERP_MAX_ATTEMPTS` after that.
 - **Idempotency keys are global and never expire.** With authentication they would be
   scoped per client (`UNIQUE(client_id, key)`) and purged after e.g. 24 h.
 - **`limit`/`offset` pagination** is simple but slow on deep pages; keyset pagination would scale.
