@@ -219,15 +219,16 @@ curl -X DELETE localhost:8001/admin/failure-mode  # reset to the .env defaults
 The state is in memory, per process: restarting the mock ERP also resets it.
 
 `GET /erp/orders?limit=50` lists the most recent ERP orders (newest first, `limit` ≤ 200).
-It exists for the web UI below and accepts cross-origin `GET` requests from
-`http://127.0.0.1:8000` / `http://localhost:8000` only.
+For the web UI below, the mock ERP accepts cross-origin requests (`GET`, plus `PUT`/`DELETE`
+for `/admin/failure-mode`) from `http://127.0.0.1:8000` / `http://localhost:8000` only.
 
 ## Web UI (development only)
 
 With the API, the mock ERP and the worker running, open <http://127.0.0.1:8000/ui/>.
 Left: a form that calls `POST /orders` and follows the order's status
 (`PENDING → PROCESSING → SUCCESS`). Right: the orders the mock ERP actually received,
-refreshed every 2 seconds. It is a single static page (`app/static/index.html`, no build
+refreshed every 2 seconds. A failure-mode selector (under the form) drives
+`/admin/failure-mode`, so the demo scenarios can be replayed without curl. It is a single static page (`app/static/index.html`, no build
 step), a demo aid rather than a product UI (frontend UI is a PRD non-goal).
 
 ## Configuration

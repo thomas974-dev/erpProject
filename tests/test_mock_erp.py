@@ -181,3 +181,26 @@ def test_cors_allows_only_the_web_ui_origin(erp_api: TestClient) -> None:
 
     assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:8000"
     assert "access-control-allow-origin" not in other.headers
+
+
+def test_cors_preflight_allows_the_ui_to_change_the_failure_mode(erp_api: TestClient) -> None:
+    response = erp_api.options(
+        "/admin/failure-mode",
+        headers={
+            "Origin": "http://127.0.0.1:8000",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "Content-Type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "PUT" in response.headers["access-control-allow-methods"]
+
+
+def test_cors_preflight_rejects_other_origins(erp_api: TestClient) -> None:
+    response = erp_api.options(
+        "/admin/failure-mode",
+        headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "PUT"},
+    )
+
+    assert response.status_code == 400

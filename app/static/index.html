@@ -22,10 +22,15 @@
     section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; min-width: 0; }
     h2 { margin: 0 0 12px; font-size: 17px; }
     label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 13px; }
-    input { display: block; width: 100%; margin-top: 4px; padding: 8px; font: inherit; color: var(--text);
+    input, select { display: block; width: 100%; margin-top: 4px; padding: 8px; font: inherit; color: var(--text);
             background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
     button { padding: 8px 14px; font: inherit; color: #fff; background: var(--accent); border: 0; border-radius: 6px; cursor: pointer; }
     button:disabled { opacity: .6; cursor: default; }
+    button.secondary { color: var(--text); background: transparent; border: 1px solid var(--border); }
+    .row { display: flex; gap: 8px; }
+    .row > label { flex: 1; }
+    hr { margin: 20px 0 16px; border: 0; border-top: 1px solid var(--border); }
+    #failure-state.active { color: var(--warn); font-weight: 600; }
     #result { margin-top: 14px; font-size: 14px; word-break: break-all; }
     .SUCCESS { color: var(--ok); } .FAILED, .error { color: var(--ko); } .UNKNOWN { color: var(--warn); }
     .muted { color: var(--muted); font-size: 13px; }
@@ -47,6 +52,30 @@
       <button type="submit">Envoyer</button>
     </form>
     <div id="result"></div>
+
+    <hr>
+    <h2>Mode de panne du mock ERP</h2>
+    <form id="failure-form">
+      <label>Mode
+        <select name="mode">
+          <option value="normal">normal — l'ERP accepte</option>
+          <option value="http_503">http_503 — indisponible (retry auto)</option>
+          <option value="http_429">http_429 — trop de requêtes (retry auto)</option>
+          <option value="http_400">http_400 — rejet définitif (FAILED)</option>
+          <option value="timeout_before_create">timeout_before_create — rien n'est créé</option>
+          <option value="timeout_after_create">timeout_after_create — réponse perdue (UNKNOWN)</option>
+        </select>
+      </label>
+      <div class="row">
+        <label>Nb de requêtes <input name="count" type="number" min="1" step="1" placeholder="illimité"></label>
+        <label>Délai timeout (s) <input name="delay_seconds" type="number" min="0" step="0.5" placeholder="défaut"></label>
+      </div>
+      <div class="row">
+        <button type="submit">Appliquer</button>
+        <button type="button" class="secondary" id="failure-reset">Réinitialiser</button>
+      </div>
+    </form>
+    <p id="failure-state" class="muted"></p>
   </section>
 
   <section>
@@ -151,8 +180,53 @@
     }
   }
 
-  refreshErpOrders();
-  setInterval(refreshErpOrders, 2000);
+  // --- Failure mode selector (drives the mock ERP's /admin/failure-mode) ---
+  const failureForm = document.getElementById("failure-form");
+  const failureState = document.getElementById("failure-state");
+
+  function showFailureState(state) {
+    const scope = state.remaining === null ? "toutes les requêtes" : `encore ${state.remaining} requête(s)`;
+    const delay = state.mode.startsWith("timeout") ? `, délai ${state.delay_seconds} s` : "";
+    failureState.textContent = `Mode actif : ${state.mode} (${scope}${delay})`;
+    failureState.className = state.mode === "normal" ? "muted" : "active";
+  }
+
+  async function callFailureMode(method, body) {
+    try {
+      const response = await fetch(`${ERP_URL}/admin/failure-mode`, {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      showFailureState(await response.json());
+    } catch (error) {
+      failureState.textContent = `Mock ERP injoignable (${error.message})`;
+      failureState.className = "error";
+    }
+  }
+
+  failureForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(failureForm);
+    const config = { mode: data.get("mode") };
+    // Empty fields are left out: the mock ERP then applies its defaults.
+    if (data.get("count")) config.count = Number(data.get("count"));
+    if (data.get("delay_seconds")) config.delay_seconds = Number(data.get("delay_seconds"));
+    callFailureMode("PUT", config);
+  });
+  document.getElementById("failure-reset").addEventListener("click", () => {
+    failureForm.reset();
+    callFailureMode("DELETE");
+  });
+
+  function refresh() {
+    refreshErpOrders();
+    callFailureMode("GET");  // also reflects counts being consumed and changes made via curl
+  }
+
+  refresh();
+  setInterval(refresh, 2000);
 </script>
 </body>
 </html>

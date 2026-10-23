@@ -24,7 +24,13 @@ app = FastAPI(
     version="0.1.0",
     description="Simulated external ERP with deterministic failure injection (dev only).",
 )
-app.add_middleware(CORSMiddleware, allow_origins=UI_ORIGINS, allow_methods=["GET"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=UI_ORIGINS,
+    # PUT/DELETE + Content-Type: the UI's failure-mode selector (/admin/failure-mode).
+    allow_methods=["GET", "PUT", "DELETE"],
+    allow_headers=["Content-Type"],
+)
 
 _settings = get_settings()
 failure_injector = FailureInjector(
