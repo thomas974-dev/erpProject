@@ -385,3 +385,10 @@ def test_concurrent_retries_have_exactly_one_winner(
         results = sorted(pool.map(retry, range(2)))
 
     assert results == ["accepted", "rejected"]
+
+
+def test_web_ui_is_served(client: TestClient) -> None:
+    response = client.get("/ui/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")

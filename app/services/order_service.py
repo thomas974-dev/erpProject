@@ -13,6 +13,10 @@ from app.schemas.order import OrderCreate
 
 class OrderNotFoundError(Exception):
     def __init__(self, order_id: uuid.UUID) -> None:
+        """Raised for an unknown order ID; mapped to 404 by the API.
+
+        Milestone 2.
+        """
         super().__init__(f"Order {order_id} not found")
         self.order_id = order_id
 
@@ -23,6 +27,10 @@ class IdempotencyConflictError(Exception):
 
 class OrderNotRetryableError(Exception):
     def __init__(self, order_id: uuid.UUID, status: OrderStatus) -> None:
+        """Raised when retrying an order that is not FAILED/UNKNOWN; mapped to 409.
+
+        Milestone 6.
+        """
         super().__init__(f"Order {order_id} is {status}; only FAILED or UNKNOWN can be retried")
         self.status = status
 
@@ -34,18 +42,30 @@ class CreateOrderResult:
 
 
 def compute_request_hash(data: OrderCreate) -> str:
-    """SHA-256 of the validated (hence normalized) payload, serialized canonically."""
+    """SHA-256 of the validated (hence normalized) payload, serialized canonically.
+
+    Milestone 3: detects an Idempotency-Key reused with a different payload.
+    """
     canonical = json.dumps(data.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class OrderService:
     def __init__(self, session: Session) -> None:
+        """API-side business logic for orders, on one DB session.
+
+        Milestone 2 (in memory), PostgreSQL since Milestone 3.
+        """
         self._session = session
 
     def create_order(
         self, data: OrderCreate, idempotency_key: str | None = None
     ) -> CreateOrderResult:
+        """Store a new PENDING order, or return the original one for a replayed key.
+
+        Milestone 2 (creation), 3 (idempotency, race-safe through the unique constraint).
+        Raises IdempotencyConflictError if the key was used with another payload.
+        """
         request_hash = compute_request_hash(data)
 
         if idempotency_key is not None:
@@ -82,6 +102,10 @@ class OrderService:
         return CreateOrderResult(order=order, created=True)
 
     def get_order(self, order_id: uuid.UUID) -> Order:
+        """Return the order or raise OrderNotFoundError.
+
+        Milestone 2, persisted in Milestone 3.
+        """
         order = self._session.get(Order, order_id)
         if order is None:
             raise OrderNotFoundError(order_id)
@@ -89,7 +113,10 @@ class OrderService:
 
     def retry_order(self, order_id: uuid.UUID) -> Order:
         """Move a FAILED/UNKNOWN order back to PENDING. Atomic: when two retry requests race,
-        exactly one wins, so at most one new task is scheduled."""
+        exactly one wins, so at most one new task is scheduled.
+
+        Milestone 6: manual retry. needs_reconciliation is left untouched on purpose.
+        """
         order = self._session.scalars(
             update(Order)
             .where(Order.id == order_id, Order.status.in_(RETRYABLE_STATUSES))
@@ -105,7 +132,10 @@ class OrderService:
     def list_orders(
         self, *, status: OrderStatus | None, limit: int, offset: int
     ) -> tuple[list[Order], int]:
-        """Return one page of orders (newest first) and the total matching count."""
+        """Return one page of orders (newest first) and the total matching count.
+
+        Milestone 2, persisted in Milestone 3.
+        """
         filters = [Order.status == status] if status is not None else []
         page = self._session.scalars(
             select(Order)
@@ -119,12 +149,20 @@ class OrderService:
         return list(page), total or 0
 
     def _find_by_idempotency_key(self, idempotency_key: str) -> Order | None:
+        """Return the order created with this Idempotency-Key, if any.
+
+        Milestone 3.
+        """
         return self._session.scalars(
             select(Order).where(Order.idempotency_key == idempotency_key)
         ).one_or_none()
 
     @staticmethod
     def _replay(existing: Order, request_hash: str) -> CreateOrderResult:
+        """Same key + same payload -> original order; different payload -> conflict.
+
+        Milestone 3: client idempotency (no second order, no second task).
+        """
         if existing.request_hash != request_hash:
             raise IdempotencyConflictError(
                 "Idempotency-Key was already used with a different request payload"

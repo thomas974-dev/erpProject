@@ -13,11 +13,18 @@ OrderDispatcher = Callable[[uuid.UUID], None]
 
 
 def get_order_service(session: Annotated[Session, Depends(get_db)]) -> OrderService:
+    """FastAPI dependency: an OrderService bound to the request's DB session.
+
+    Milestone 2 (in-memory service), wired to PostgreSQL in Milestone 3.
+    """
     return OrderService(session)
 
 
 def get_order_dispatcher() -> OrderDispatcher:
-    """Schedules background processing; overridden in tests to avoid needing Redis."""
+    """Schedules background processing; overridden in tests to avoid needing Redis.
+
+    Milestone 5: the API enqueues a Celery task instead of calling the ERP itself.
+    """
     return enqueue_order_processing
 
 

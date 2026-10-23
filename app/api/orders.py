@@ -21,6 +21,11 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 
 def schedule_processing(dispatch: OrderDispatcher, order_id: UUID) -> None:
+    """Publish the processing task; a broker failure is logged, not raised.
+
+    Milestone 5 (enqueue after commit). The order stays PENDING if Redis is down: known
+    limitation, no outbox.
+    """
     try:
         dispatch(order_id)
     except BrokerError:
@@ -32,6 +37,10 @@ def schedule_processing(dispatch: OrderDispatcher, order_id: UUID) -> None:
 
 
 def accepted(request: Request, response: Response, order: Order) -> OrderAccepted:
+    """Build the 202 body and the `Location` header pointing to GET /orders/{id}.
+
+    Milestone 6: shared by POST /orders and POST /orders/{id}/retry.
+    """
     status_url = request.app.url_path_for("get_order", order_id=str(order.id))
     response.headers["Location"] = status_url
     return OrderAccepted(
@@ -61,6 +70,10 @@ def create_order(
     dispatch: OrderDispatcherDep,
     idempotency_key: Annotated[str | None, Header(min_length=1, max_length=255)] = None,
 ) -> OrderAccepted:
+    """POST /orders: persist the order as PENDING, enqueue it, answer 202 at once.
+
+    Milestone 2 (endpoint), 3 (Idempotency-Key: replay or 409), 5 (asynchronous processing).
+    """
     try:
         result = service.create_order(payload, idempotency_key=idempotency_key)
     except IdempotencyConflictError as exc:
@@ -96,7 +109,10 @@ def retry_order(
     service: OrderServiceDep,
     dispatch: OrderDispatcherDep,
 ) -> OrderAccepted:
-    """Manual retry: the worker reconciles with the ERP before any new create call."""
+    """Manual retry: the worker reconciles with the ERP before any new create call.
+
+    Milestone 6: only FAILED/UNKNOWN orders can be retried, otherwise 409.
+    """
     try:
         order = service.retry_order(order_id)
     except OrderNotFoundError as exc:
@@ -121,6 +137,10 @@ def list_orders(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> OrderList:
+    """GET /orders: paginated list, newest first, optionally filtered by status.
+
+    Milestone 2 (endpoint), backed by PostgreSQL in Milestone 3.
+    """
     orders, total = service.list_orders(status=status_filter, limit=limit, offset=offset)
     return OrderList(
         items=[OrderRead.model_validate(order) for order in orders],
@@ -136,6 +156,10 @@ def list_orders(
     responses={status.HTTP_404_NOT_FOUND: {"description": "Order not found"}},
 )
 def get_order(order_id: UUID, service: OrderServiceDep) -> OrderRead:
+    """GET /orders/{id}: current status, read from the DB (never from Celery). 404 if unknown.
+
+    Milestone 2 (endpoint), backed by PostgreSQL in Milestone 3.
+    """
     try:
         order = service.get_order(order_id)
     except OrderNotFoundError as exc:

@@ -21,6 +21,10 @@ RETRYABLE_STATUSES = (OrderStatus.FAILED, OrderStatus.UNKNOWN)
 
 
 def utc_now() -> datetime:
+    """Timezone-aware current time, used for created_at/updated_at.
+
+    Milestone 3.
+    """
     return datetime.now(UTC)
 
 

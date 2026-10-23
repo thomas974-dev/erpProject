@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Order to ERP</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7280; --border: #e3e6eb;
+      --accent: #2563eb; --ok: #15803d; --ko: #b91c1c; --warn: #b45309;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418; --panel: #1a1e24; --text: #e6e8eb; --muted: #9aa3ae; --border: #2c323a;
+        --accent: #60a5fa; --ok: #4ade80; --ko: #f87171; --warn: #fbbf24;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    main { display: grid; grid-template-columns: minmax(260px, 1fr) 2fr; gap: 16px; padding: 16px; }
+    @media (max-width: 700px) { main { grid-template-columns: 1fr; } }
+    section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; min-width: 0; }
+    h2 { margin: 0 0 12px; font-size: 17px; }
+    label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 13px; }
+    input { display: block; width: 100%; margin-top: 4px; padding: 8px; font: inherit; color: var(--text);
+            background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+    button { padding: 8px 14px; font: inherit; color: #fff; background: var(--accent); border: 0; border-radius: 6px; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: default; }
+    #result { margin-top: 14px; font-size: 14px; word-break: break-all; }
+    .SUCCESS { color: var(--ok); } .FAILED, .error { color: var(--ko); } .UNKNOWN { color: var(--warn); }
+    .muted { color: var(--muted); font-size: 13px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 600; }
+    code { font-size: 12px; }
+  </style>
+</head>
+<body>
+<main>
+  <section>
+    <h2>Nouvelle commande</h2>
+    <form id="order-form">
+      <label>Client <input name="customer_id" value="CLIENT-123" required></label>
+      <label>Produit <input name="product_id" value="PRODUCT-456" required></label>
+      <label>Quantité <input name="quantity" type="number" value="10" min="1" step="1" required></label>
+      <button type="submit">Envoyer</button>
+    </form>
+    <div id="result"></div>
+  </section>
+
+  <section>
+    <h2>Commandes reçues par le mock ERP</h2>
+    <p id="erp-status" class="muted">Chargement…</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Reçue à</th><th>Client</th><th>Produit</th><th>Qté</th><th>external_order_id</th><th>erp_order_id</th></tr></thead>
+        <tbody id="erp-orders"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+  // The page is served by the Orders API; the mock ERP runs on port 8001 of the same host.
+  const ERP_URL = `${location.protocol}//${location.hostname}:8001`;
+  const FINAL = new Set(["SUCCESS", "FAILED", "UNKNOWN"]);
+  const form = document.getElementById("order-form");
+  const result = document.getElementById("result");
+
+  function show(text, cls = "") {
+    const line = document.createElement("div");
+    line.textContent = text;
+    line.className = cls;
+    result.append(line);
+  }
+
+  async function follow(statusUrl) {
+    const seen = [];
+    for (let i = 0; i < 120; i++) {  // ~60 s max
+      const order = await (await fetch(statusUrl)).json();
+      if (seen.at(-1) !== order.status) {
+        seen.push(order.status);
+        show(`→ ${order.status}`, order.status);
+      }
+      if (FINAL.has(order.status)) {
+        if (order.last_error) show(order.last_error, "error");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const payload = {
+      customer_id: data.get("customer_id"),
+      product_id: data.get("product_id"),
+      quantity: Number(data.get("quantity")),
+    };
+    const button = form.querySelector("button");
+    button.disabled = true;
+    result.replaceChildren();
+    try {
+      const response = await fetch("/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        const detail = Array.isArray(body.detail)
+          ? body.detail.map((e) => `${e.loc.at(-1)}: ${e.msg}`).join(" ; ")
+          : body.detail;
+        show(`HTTP ${response.status} — ${detail}`, "error");
+        return;
+      }
+      show(`HTTP ${response.status} — commande ${body.id}`);
+      await follow(body.status_url);
+    } catch (error) {
+      show(`API injoignable (${error.message})`, "error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  async function refreshErpOrders() {
+    const status = document.getElementById("erp-status");
+    try {
+      const response = await fetch(`${ERP_URL}/erp/orders`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const orders = await response.json();
+      const rows = orders.map((o) => {
+        const tr = document.createElement("tr");
+        const cells = [new Date(o.created_at).toLocaleTimeString(), o.customer_id, o.product_id,
+                       o.quantity, o.external_order_id, o.erp_order_id];
+        for (const value of cells) {
+          const td = document.createElement("td");
+          td.textContent = value;  // ERP data is never injected as HTML
+          tr.append(td);
+        }
+        return tr;
+      });
+      document.getElementById("erp-orders").replaceChildren(...rows);
+      status.textContent = `${orders.length} commande(s) — rafraîchi à ${new Date().toLocaleTimeString()}`;
+      status.className = "muted";
+    } catch (error) {
+      status.textContent = `Mock ERP injoignable sur ${ERP_URL} (${error.message})`;
+      status.className = "error";
+    }
+  }
+
+  refreshErpOrders();
+  setInterval(refreshErpOrders, 2000);
+</script>
+</body>
+</html>

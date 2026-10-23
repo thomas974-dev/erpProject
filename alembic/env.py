@@ -22,7 +22,10 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """Emit SQL to stdout instead of executing it (`alembic upgrade head --sql`)."""
+    """Emit SQL to stdout instead of executing it (`alembic upgrade head --sql`).
+
+    Milestone 3.
+    """
     context.configure(
         url=config.get_main_option("sqlalchemy.url"),
         target_metadata=target_metadata,
@@ -34,6 +37,10 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    """Apply migrations against the configured database.
+
+    Milestone 3.
+    """
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

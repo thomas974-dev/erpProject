@@ -51,6 +51,10 @@ class RetryPolicy:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
+        """Build the policy from ERP_MAX_ATTEMPTS and the retry delay settings.
+
+        Milestone 6: bounded automatic retries.
+        """
         return cls(
             max_attempts=settings.erp_max_attempts,
             base_delay=settings.erp_retry_base_delay_seconds,
@@ -63,7 +67,10 @@ class RetryPolicy:
         retry_after: float | None = None,
         rng: Callable[[], float] = random.random,
     ) -> float:
-        """Exponential backoff with full jitter, honouring Retry-After (both capped)."""
+        """Exponential backoff with full jitter, honouring Retry-After (both capped).
+
+        Milestone 6.
+        """
         backoff = min(self.max_delay, self.base_delay * 2 ** (attempt - 1))
         delay = backoff * rng()  # full jitter: spreads out retries of many failing orders
         if retry_after is not None:
@@ -85,13 +92,21 @@ class OrderProcessor:
         policy: RetryPolicy,
         rng: Callable[[], float] = random.random,
     ) -> None:
+        """Worker-side processing of one order; dependencies are injected for tests.
+
+        Milestone 5 (session + ERP client), 6 (retry policy, injectable randomness).
+        """
         self._session = session
         self._erp = erp
         self._policy = policy
         self._rng = rng
 
     def process(self, order_id: uuid.UUID) -> ProcessOutcome | None:
-        """Process a PENDING or UNKNOWN order. Returns None if it could not be claimed."""
+        """Process a PENDING or UNKNOWN order. Returns None if it could not be claimed.
+
+        Milestone 5 (claim -> create -> final status), 6 (reconciliation first when the
+        previous outcome is uncertain; an unexpected error ends in UNKNOWN, never FAILED).
+        """
         order = self._claim(order_id)
         if order is None:
             # Unknown id, or already claimed/processed (e.g. a redelivered message).
@@ -118,6 +133,8 @@ class OrderProcessor:
         """Atomically move PENDING/UNKNOWN -> PROCESSING. At most one caller can win.
 
         The transaction is committed before any ERP call: no lock is held over the network.
+
+        Milestone 5 (conditional UPDATE), extended to UNKNOWN in Milestone 6.
         """
         order = self._session.scalars(
             update(Order)
@@ -136,7 +153,10 @@ class OrderProcessor:
         return order
 
     def _reconcile(self, order: Order) -> ProcessOutcome | None:
-        """Look the order up in the ERP. Returns None only if it is confirmed absent."""
+        """Look the order up in the ERP. Returns None only if it is confirmed absent.
+
+        Milestone 6: never re-send a create whose outcome is uncertain without checking first.
+        """
         try:
             existing = self._erp.get_order_by_external_id(order.external_order_id)
         except ErpError as exc:
@@ -169,6 +189,11 @@ class OrderProcessor:
         )
 
     def _create(self, order: Order) -> ProcessOutcome:
+        """Send the create request and map the classified ERP error to a status.
+
+        Milestone 5 (create call), 6 (write-ahead `needs_reconciliation`, PENDING + retry on
+        transient errors, FAILED on permanent ones, UNKNOWN on uncertain ones).
+        """
         # Record the intent durably before the request can reach the ERP.
         order.needs_reconciliation = True
         self._session.commit()
@@ -225,6 +250,10 @@ class OrderProcessor:
         )
 
     def _next_retry_delay(self, order: Order, retry_after: float | None = None) -> float | None:
+        """Delay before the next automatic attempt, or None once the budget is spent.
+
+        Milestone 6: bounded by ERP_MAX_ATTEMPTS.
+        """
         if order.attempt_count >= self._policy.max_attempts:
             return None
         return self._policy.delay(order.attempt_count, retry_after, self._rng)
@@ -240,6 +269,10 @@ class OrderProcessor:
         retry_in: float | None = None,
         needs_reconciliation: bool | None = None,  # None: leave unchanged
     ) -> ProcessOutcome:
+        """Commit the attempt's outcome, log it, and tell the task whether to re-enqueue.
+
+        Milestone 5 (final status), 6 (retry_in, needs_reconciliation), 7 (error_category).
+        """
         order.status = status
         order.erp_order_id = erp_order_id
         order.last_error = error
@@ -260,6 +293,10 @@ class OrderProcessor:
 
     @staticmethod
     def _log(event: str, order: Order, level: int = logging.INFO, **fields: object) -> None:
+        """Log an event with the order's correlation fields (id, external id, attempt).
+
+        Milestone 7.
+        """
         log_event(
             logger,
             event,
@@ -272,6 +309,10 @@ class OrderProcessor:
 
 
 def _same_order(order: Order, erp_order: ErpOrder) -> bool:
+    """True if the ERP holds the same customer, product and quantity as our order.
+
+    Milestone 6: decides SUCCESS vs FAILED (data mismatch) during reconciliation.
+    """
     return (order.customer_id, order.product_id, order.quantity) == (
         erp_order.customer_id,
         erp_order.product_id,

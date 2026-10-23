@@ -18,11 +18,19 @@ ReadinessCheck = Callable[[], None]
 
 
 def check_database() -> None:
+    """Readiness check: PostgreSQL answers `SELECT 1`. Raises on failure.
+
+    Milestone 7.
+    """
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
 
 
 def check_broker() -> None:
+    """Readiness check: Redis (the Celery broker) answers PING. Raises on failure.
+
+    Milestone 7.
+    """
     client = redis.Redis.from_url(
         get_settings().celery_broker_url, socket_timeout=1, socket_connect_timeout=1
     )
@@ -33,12 +41,19 @@ def check_broker() -> None:
 
 
 def get_readiness_checks() -> dict[str, ReadinessCheck]:
+    """FastAPI dependency listing the checks run by /ready (overridden in tests).
+
+    Milestone 7.
+    """
     return {"database": check_database, "broker": check_broker}
 
 
 @router.get("/health")
 def health() -> dict[str, str]:
-    """Liveness only: the API process is running. Does not check PostgreSQL or Redis."""
+    """Liveness only: the API process is running. Does not check PostgreSQL or Redis.
+
+    Milestone 2.
+    """
     return {"status": "ok"}
 
 
@@ -50,7 +65,10 @@ def ready(
     response: Response,
     checks: Annotated[dict[str, ReadinessCheck], Depends(get_readiness_checks)],
 ) -> dict[str, Any]:
-    """Readiness: PostgreSQL and Redis (the broker) both answer."""
+    """Readiness: PostgreSQL and Redis (the broker) both answer.
+
+    Milestone 7: returns 503 with per-dependency results when one is down.
+    """
     results: dict[str, str] = {}
     for name, check in checks.items():
         try:

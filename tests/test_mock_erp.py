@@ -148,3 +148,36 @@ def test_injector_consume_without_count_keeps_mode() -> None:
     injector.configure(FailureConfig(mode="http_503"))
 
     assert [injector.consume()[0] for _ in range(3)] == ["http_503"] * 3
+
+
+# --- list endpoint (web UI) ----------------------------------------------------
+
+
+def test_list_is_empty_without_orders(erp_api: TestClient) -> None:
+    response = erp_api.get("/erp/orders")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_list_returns_newest_first_and_honours_limit(erp_api: TestClient) -> None:
+    for external_id in ("ext-1", "ext-2", "ext-3"):
+        erp_api.post("/erp/orders", json={**PAYLOAD, "external_order_id": external_id})
+
+    all_orders = erp_api.get("/erp/orders").json()
+    limited = erp_api.get("/erp/orders", params={"limit": 2}).json()
+
+    assert [o["external_order_id"] for o in all_orders] == ["ext-3", "ext-2", "ext-1"]
+    assert [o["external_order_id"] for o in limited] == ["ext-3", "ext-2"]
+
+
+def test_list_rejects_invalid_limit(erp_api: TestClient) -> None:
+    assert erp_api.get("/erp/orders", params={"limit": 0}).status_code == 422
+
+
+def test_cors_allows_only_the_web_ui_origin(erp_api: TestClient) -> None:
+    allowed = erp_api.get("/erp/orders", headers={"Origin": "http://127.0.0.1:8000"})
+    other = erp_api.get("/erp/orders", headers={"Origin": "http://evil.example"})
+
+    assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:8000"
+    assert "access-control-allow-origin" not in other.headers

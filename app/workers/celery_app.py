@@ -35,6 +35,10 @@ celery_app.conf.update(
 
 @setup_logging.connect
 def _configure_logging(**_: Any) -> None:
+    """Make Celery and the worker log JSON lines like the API.
+
+    Milestone 7.
+    """
     # Connecting this signal stops Celery from installing its own handlers: worker and
     # Celery internals then log JSON lines like the API.
     configure_logging(get_settings().log_level)

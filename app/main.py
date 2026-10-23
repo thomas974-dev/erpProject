@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.api import health, orders
 from app.core.config import get_settings
@@ -13,3 +16,5 @@ app = FastAPI(
 )
 app.include_router(health.router)
 app.include_router(orders.router)
+# Dev-only web UI: create an order, watch the mock ERP receive it (see README).
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")

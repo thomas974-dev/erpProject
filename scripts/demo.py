@@ -21,13 +21,20 @@ erp = httpx.Client(base_url=ERP_URL, timeout=5)
 
 
 def set_failure(config: dict[str, Any] | None) -> None:
+    """Reset the mock ERP failure mode, then apply `config` if given.
+
+    Milestone 7.
+    """
     erp.delete("/admin/failure-mode").raise_for_status()
     if config:
         erp.put("/admin/failure-mode", json=config).raise_for_status()
 
 
 def follow(status_url: str, until: set[str] = FINAL, timeout: float = 30) -> dict[str, Any]:
-    """Poll the order and print every status transition."""
+    """Poll the order and print every status transition.
+
+    Milestone 7.
+    """
     transitions: list[str] = []
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -45,6 +52,10 @@ def follow(status_url: str, until: set[str] = FINAL, timeout: float = 30) -> dic
 
 
 def submit() -> str:
+    """POST the demo order, print how fast the 202 came back, return its status URL.
+
+    Milestone 7: shows the API does not wait for the ERP.
+    """
     started = time.monotonic()
     response = api.post("/orders", json=ORDER)
     response.raise_for_status()
@@ -55,11 +66,19 @@ def submit() -> str:
 
 
 def expect(condition: bool, message: str) -> bool:
+    """Print OK/FAIL for a check and return it.
+
+    Milestone 7.
+    """
     print(f"   {'OK  ' if condition else 'FAIL'} {message}")
     return condition
 
 
 def scenario_success() -> bool:
+    """Scenario 1: happy path, PENDING -> PROCESSING -> SUCCESS.
+
+    Milestone 7 (demonstrates Milestone 5).
+    """
     print("\n1) Happy path")
     set_failure(None)
     order = follow(submit())
@@ -67,6 +86,10 @@ def scenario_success() -> bool:
 
 
 def scenario_transient() -> bool:
+    """Scenario 2: two 503s, then success after automatic retries.
+
+    Milestone 7 (demonstrates Milestone 6).
+    """
     print("\n2) Transient failure: the ERP answers 503 twice, then recovers")
     set_failure({"mode": "http_503", "count": 2})
     order = follow(submit())
@@ -77,6 +100,10 @@ def scenario_transient() -> bool:
 
 
 def scenario_permanent_then_manual_retry() -> bool:
+    """Scenario 3: 400 -> FAILED without auto-retry, manual retry -> SUCCESS, then 409.
+
+    Milestone 7 (demonstrates Milestone 6).
+    """
     print("\n3) Permanent failure (400), then manual retry once the ERP accepts it")
     set_failure({"mode": "http_400", "count": 1})
     status_url = submit()
@@ -94,6 +121,10 @@ def scenario_permanent_then_manual_retry() -> bool:
 
 
 def scenario_lost_response() -> bool:
+    """Scenario 4: lost response -> UNKNOWN -> reconciled -> SUCCESS, one ERP order.
+
+    Milestone 7 (demonstrates Milestone 6).
+    """
     print("\n4) Unknown outcome: the ERP creates the order, then the response is lost")
     set_failure({"mode": "timeout_after_create", "delay_seconds": 5, "count": 1})
     order = follow(submit(), timeout=40)
@@ -107,6 +138,10 @@ def scenario_lost_response() -> bool:
 
 
 def main() -> int:
+    """Check /ready, run every scenario, always restore the `normal` failure mode.
+
+    Milestone 7.
+    """
     ready = api.get("/ready")
     if ready.status_code != 200:
         print(f"API not ready: {ready.json()}")

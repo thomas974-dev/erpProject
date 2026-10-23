@@ -38,5 +38,8 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return a process-wide Settings instance (cached; usable as a FastAPI dependency)."""
+    """Return a process-wide Settings instance (cached; usable as a FastAPI dependency).
+
+    Milestone 1: configuration from `.env`, shared by the API, the worker and the mock ERP.
+    """
     return Settings()

@@ -12,13 +12,20 @@ from app.workers.celery_app import celery_app
 
 @worker_process_init.connect
 def _reset_db_pool(**_: Any) -> None:
+    """Give each prefork child process its own DB connection pool.
+
+    Milestone 5.
+    """
     # Prefork pool: never share the parent's pooled DB connections with child processes.
     engine.dispose(close=False)
 
 
 @celery_app.task(name="orders.process_order")
 def process_order(order_id: str) -> None:
-    """Takes an order ID only; the current data is reloaded from PostgreSQL."""
+    """Takes an order ID only; the current data is reloaded from PostgreSQL.
+
+    Milestone 5 (Celery task), 6 (re-enqueues itself with a backoff countdown).
+    """
     settings = get_settings()
     with SessionLocal() as session, ErpClient.from_settings(settings) as erp:
         processor = OrderProcessor(session, erp, RetryPolicy.from_settings(settings))
@@ -31,4 +38,8 @@ def process_order(order_id: str) -> None:
 
 
 def enqueue_order_processing(order_id: uuid.UUID) -> None:
+    """Publish `process_order` for this order (the API's default dispatcher).
+
+    Milestone 5.
+    """
     process_order.delay(str(order_id))

@@ -31,6 +31,10 @@ class ErpError(Exception):
 
 class ErpTransientError(ErpError):
     def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        """Certainly not processed; `retry_after` comes from the Retry-After header.
+
+        Milestone 4.
+        """
         super().__init__(message)
         self.retry_after = retry_after
 
@@ -54,7 +58,10 @@ class ErpOrder(BaseModel):
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """Retry-After is either a number of seconds or an HTTP date."""
+    """Retry-After is either a number of seconds or an HTTP date.
+
+    Milestone 4.
+    """
     if value is None:
         return None
     try:
@@ -71,7 +78,10 @@ def parse_retry_after(value: str | None) -> float | None:
 
 
 def describe_response(response: httpx.Response) -> str:
-    """Short, sanitized description: status code and a truncated `detail` only."""
+    """Short, sanitized description: status code and a truncated `detail` only.
+
+    Milestone 4: safe to store in orders.last_error.
+    """
     message = f"ERP returned HTTP {response.status_code}"
     try:
         detail = response.json().get("detail")
@@ -90,16 +100,32 @@ class ErpClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        """Synchronous HTTPX client; `transport` lets unit tests use httpx.MockTransport.
+
+        Milestone 4.
+        """
         self._http = httpx.Client(base_url=base_url, timeout=timeout_seconds, transport=transport)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
+        """Build a client from ERP_BASE_URL and ERP_HTTP_TIMEOUT_SECONDS.
+
+        Milestone 4.
+        """
         return cls(settings.erp_base_url, settings.erp_http_timeout_seconds)
 
     def close(self) -> None:
+        """Close the underlying connection pool.
+
+        Milestone 4.
+        """
         self._http.close()
 
     def __enter__(self) -> Self:
+        """Context manager support, so the worker always closes the client.
+
+        Milestone 4.
+        """
         return self
 
     def __exit__(
@@ -108,12 +134,19 @@ class ErpClient:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        """Close the client when leaving the `with` block.
+
+        Milestone 4.
+        """
         self.close()
 
     def create_order(
         self, *, external_order_id: str, customer_id: str, product_id: str, quantity: int
     ) -> ErpOrder:
-        """Create (or idempotently re-fetch) the ERP order for `external_order_id`."""
+        """Create (or idempotently re-fetch) the ERP order for `external_order_id`.
+
+        Milestone 4: classifies every failure as transient, permanent or uncertain.
+        """
         payload = {
             "external_order_id": external_order_id,
             "customer_id": customer_id,
@@ -142,7 +175,10 @@ class ErpClient:
         raise ErpUncertainError(describe_response(response))
 
     def get_order_by_external_id(self, external_order_id: str) -> ErpOrder | None:
-        """Look the order up. Read-only, so every transport failure is transient."""
+        """Look the order up. Read-only, so every transport failure is transient.
+
+        Milestone 4 (lookup endpoint), used for reconciliation in Milestone 6.
+        """
         path = f"/erp/orders/by-external-id/{quote(external_order_id, safe='')}"
         try:
             response = self._http.get(path)
@@ -163,6 +199,10 @@ class ErpClient:
 
     @staticmethod
     def _parse(response: httpx.Response, *, error: type[ErpError]) -> ErpOrder:
+        """Validate the ERP response body; raise `error` if it is malformed.
+
+        Milestone 4.
+        """
         try:
             return ErpOrder.model_validate_json(response.content)
         except ValidationError as exc:

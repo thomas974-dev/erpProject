@@ -25,11 +25,19 @@ from mock_erp.main import failure_injector
 
 
 def _test_database_url() -> URL:
+    """The configured database URL with a `_test` suffix: tests never touch dev data.
+
+    Milestone 3.
+    """
     url = make_url(get_settings().database_url)
     return url.set(database=f"{url.database}_test")
 
 
 def _create_database_if_missing(url: URL) -> None:
+    """Create the test database on first run.
+
+    Milestone 3.
+    """
     # CREATE DATABASE cannot run inside a transaction, hence AUTOCOMMIT.
     admin_engine = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
     try:
@@ -45,6 +53,10 @@ def _create_database_if_missing(url: URL) -> None:
 
 @pytest.fixture(scope="session")
 def alembic_config() -> Config:
+    """Alembic configuration pointing at the test database.
+
+    Milestone 3.
+    """
     url = _test_database_url()
     _create_database_if_missing(url)
     config = Config("alembic.ini")
@@ -56,6 +68,10 @@ def alembic_config() -> Config:
 
 @pytest.fixture(scope="session")
 def db_engine(alembic_config: Config) -> Iterator[Engine]:
+    """Engine on the test database, rebuilt from migrations once per session.
+
+    Milestone 3.
+    """
     # Start from an empty schema each run: also exercises every downgrade() and upgrade().
     command.downgrade(alembic_config, "base")
     command.upgrade(alembic_config, "head")
@@ -66,6 +82,10 @@ def db_engine(alembic_config: Config) -> Iterator[Engine]:
 
 @pytest.fixture
 def session_factory(db_engine: Engine) -> sessionmaker[Session]:
+    """Session factory on empty tables (TRUNCATE before each test).
+
+    Milestone 3.
+    """
     with db_engine.begin() as connection:
         connection.execute(text("TRUNCATE TABLE orders, erp_orders"))
     return sessionmaker(bind=db_engine, expire_on_commit=False)
@@ -73,13 +93,20 @@ def session_factory(db_engine: Engine) -> sessionmaker[Session]:
 
 @pytest.fixture
 def db_session(session_factory: sessionmaker[Session]) -> Iterator[Session]:
+    """One session on the clean test database.
+
+    Milestone 3.
+    """
     with session_factory() as session:
         yield session
 
 
 @pytest.fixture
 def dispatched() -> list[uuid.UUID]:
-    """Order IDs the API scheduled for processing (instead of publishing to Redis)."""
+    """Order IDs the API scheduled for processing (instead of publishing to Redis).
+
+    Milestone 5.
+    """
     return []
 
 
@@ -87,7 +114,13 @@ def dispatched() -> list[uuid.UUID]:
 def client(
     session_factory: sessionmaker[Session], dispatched: list[uuid.UUID]
 ) -> Iterator[TestClient]:
+    """API test client on the test database, with a recording fake dispatcher.
+
+    Milestone 2, test database since Milestone 3, fake dispatcher since Milestone 5.
+    """
+
     def override_get_db() -> Iterator[Session]:
+        """Request-scoped session on the test database."""
         with session_factory() as session:
             yield session
 
@@ -103,7 +136,10 @@ def client(
 
 @pytest.fixture
 def erp_failures() -> Iterator[FailureInjector]:
-    """The mock ERP's failure injector, reset to `normal` before and after each test."""
+    """The mock ERP's failure injector, reset to `normal` before and after each test.
+
+    Milestone 4.
+    """
     failure_injector.reset()
     yield failure_injector
     failure_injector.reset()
@@ -113,9 +149,13 @@ def erp_failures() -> Iterator[FailureInjector]:
 def erp_api(
     session_factory: sessionmaker[Session], erp_failures: FailureInjector
 ) -> Iterator[TestClient]:
-    """In-process client for the mock ERP app (no real network)."""
+    """In-process client for the mock ERP app (no real network).
+
+    Milestone 4.
+    """
 
     def override_get_db() -> Iterator[Session]:
+        """Request-scoped session on the test database."""
         with session_factory() as session:
             yield session
 
@@ -129,6 +169,10 @@ def erp_api(
 
 
 def _free_port() -> int:
+    """Ask the OS for a free local TCP port.
+
+    Milestone 4.
+    """
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -137,10 +181,14 @@ def _free_port() -> int:
 @pytest.fixture(scope="session")
 def mock_erp_server(db_engine: Engine) -> Iterator[str]:
     """The mock ERP served by a real uvicorn in a background thread: real sockets, real
-    timeouts. Yields its base URL."""
+    timeouts. Yields its base URL.
+
+    Milestone 4.
+    """
     test_sessions = sessionmaker(bind=db_engine, expire_on_commit=False)
 
     def override_get_db() -> Iterator[Session]:
+        """Request-scoped session on the test database."""
         with test_sessions() as session:
             yield session
 
@@ -170,5 +218,8 @@ def erp_base_url(
     session_factory: sessionmaker[Session],
     erp_failures: FailureInjector,
 ) -> str:
-    """Base URL of the running mock ERP, with empty tables and `normal` mode."""
+    """Base URL of the running mock ERP, with empty tables and `normal` mode.
+
+    Milestone 4.
+    """
     return mock_erp_server
